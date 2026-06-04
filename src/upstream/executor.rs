@@ -20,6 +20,10 @@ pub enum UpstreamEvent {
     Delta(QwenDelta),
     Done,
     Error(String),
+    /// 即將跨帳號重試（通常因上游 quota/rate-limit 中斷）。
+    /// 下游（mod.rs）收到後應重置 `answer_buf` / `ReasoningTracker` / `streamed_content`
+    /// 等本輪累積狀態，避免上一輪殘片混入下一輪解析或重複 yield。
+    Retrying,
 }
 
 #[derive(Clone)]
@@ -328,18 +332,28 @@ impl Executor {
                         return; // guard drop → 刪會話 + 釋放帳號
                     }
                     Some(err) => {
-                        // 還沒看到任何 answer-phase content 就出錯 → 跨帳號重試。
-                        // （舊版以「first_delta」為界，會把 thinking_delta 也算進去，導致 thinking
-                        // 階段中斷的 quota/internal_error 不重試直接吐給 client；現在改用實際 answer
-                        // content 為界，更貼近「客戶端是否已看到答覆」的真意。）
-                        if had_answer_content {
+                        // 重試判定優先序：
+                        // 1) 還沒看到 answer-phase content → 跨帳號重試（vehicle 客戶端尚未收到答覆）
+                        // 2) 已看到 answer content **但** 屬於「換帳號即可解」類錯誤（quota/rate-limit/
+                        //    internal_error/503）→ 也重試，並先發 Retrying 給下游重置 buffer。
+                        //    對 thinking 模型尤為關鍵：上游常先送 1-2 字 content delta 才拋 quota，
+                        //    舊版判 had_answer_content=true 不重試 → 把 raw error 吐給 client。
+                        // 3) 其他（permanent / client-side）→ 直接吐 Error 給 client
+                        let swap_retryable = is_account_swap_retryable(&err);
+                        if had_answer_content && !swap_retryable {
                             yield UpstreamEvent::Error(err);
                             return; // guard drop → 清理
+                        }
+                        if had_answer_content {
+                            // 通知 mod.rs 清空累積的 answer_buf / reasoning tracker，
+                            // 避免兩輪殘片相黏導致 tool_call 解析錯亂
+                            yield UpstreamEvent::Retrying;
                         }
                         last_error = Some(err.clone());
                         self.classify_and_mark(&email, &err).await;
                         exclude.insert(email.clone());
-                        tracing::warn!("[執行器] 串流錯誤（無 answer 內容前）可重試 第{}次 email={email} err={err}", attempt + 1);
+                        let stage = if had_answer_content { "已部分輸出但屬於換帳號可解類" } else { "無 answer 內容前" };
+                        tracing::warn!("[執行器] 串流錯誤（{stage}）可重試 第{}次 email={email} err={err}", attempt + 1);
                         continue; // guard drop → 清理本次帳號/會話，下輪重新取得
                     }
                 }
@@ -355,6 +369,7 @@ impl Executor {
 
     /// 依錯誤訊息分類並標記帳號狀態。
     async fn classify_and_mark(&self, email: &str, err: &str) {
+        // 注意：此函式只「標記帳號」，是否走重試另由呼叫端用 is_account_swap_retryable 判斷。
         let lower = err.to_lowercase();
         // 含影片/影像每日額度上限（code=RateLimited / "upper limit for today's usage"）：
         // 視為限流並冷卻，使帳號池輪換到其他帳號（重試找有額度者）。
@@ -380,6 +395,43 @@ impl Executor {
     }
 }
 
+/// 上游錯誤是否屬於「換帳號就可解」類型（quota 配額、rate-limit、暫時性 internal_error / 503）。
+/// 用於 SSE 中途已 yield 過 answer-phase content delta 後仍應跨帳號重試的判定 ——
+/// 這類錯誤跟「auth_error / 內容安全 / 客戶端格式錯」不一樣，跟使用者的 prompt 無關，
+/// 純粹是被分配到的那個上游帳號用滿了配額／被限流，下一個帳號通常會成功。
+fn is_account_swap_retryable(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    // quota / 額度：阿里云 model studio 的 "Allocated quota exceeded" 是典型；
+    // 也含 "quota exceeded"、"upper limit for today" 等變體
+    if lower.contains("quota exceeded")
+        || lower.contains("allocated quota")
+        || lower.contains("upper limit")
+        || lower.contains("today's usage")
+        || lower.contains("token-limit")
+    {
+        return true;
+    }
+    // rate limit / 429：明確指示「換一個帳號」
+    if lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimited")
+        || lower.contains("too many")
+    {
+        return true;
+    }
+    // 上游短暫不可用 / 內部錯誤（保守處理：再給一次機會、最多受 attempts 上限）
+    if lower.contains("internal_error")
+        || lower.contains("internal error")
+        || lower.contains("service unavailable")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
+    {
+        return true;
+    }
+    false
+}
+
 /// 在 byte slice 中尋找子序列位置。
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -388,4 +440,52 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_account_swap_retryable;
+
+    /// 阿里云 model studio 的真實 quota 錯誤訊息（命中 `allocated quota`／`quota exceeded`／`token-limit`）
+    #[test]
+    fn aliyun_quota_exceeded_is_swap_retryable() {
+        let real = "Qwen upstream error code=internal_error request_id=a79b... details=Allocated quota exceeded, please increase your quota limit. For details, see: https://help.aliyun.com/zh/model-studio/error-code#token-limit";
+        assert!(is_account_swap_retryable(real), "Allocated quota exceeded 應走跨帳號重試");
+    }
+
+    /// 429 / rate limit 系列
+    #[test]
+    fn rate_limit_variants_are_swap_retryable() {
+        for s in ["HTTP 429 Too Many Requests", "rate limit exceeded", "RateLimited", "too many requests"] {
+            assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
+        }
+    }
+
+    /// 上游維護性暫時錯誤
+    #[test]
+    fn transient_upstream_errors_are_swap_retryable() {
+        for s in [
+            "code=internal_error something happened",
+            "service unavailable, try again",
+            "HTTP 503 Service Unavailable",
+            "502 Bad Gateway",
+            "504 Gateway Timeout",
+        ] {
+            assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
+        }
+    }
+
+    /// 內容安全 / 認證 / 客戶端問題 → 換帳號沒用，不該重試
+    #[test]
+    fn permanent_errors_are_not_swap_retryable() {
+        for s in [
+            "code=data_inspection_failed 内容安全警告",
+            "401 Unauthorized invalid token",
+            "code=auth_error account banned",
+            "JSON 解析錯誤",
+            "expected string at line 1 column 2",
+        ] {
+            assert!(!is_account_swap_retryable(s), "不該 swap-retry: {s}");
+        }
+    }
 }

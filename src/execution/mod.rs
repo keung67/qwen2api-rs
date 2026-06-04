@@ -261,6 +261,23 @@ pub fn run_completion(
                     errored = true;
                     break;
                 }
+                UpstreamEvent::Retrying => {
+                    // executor 即將跨帳號重試本輪請求 → 清掉本輪累積，
+                    // 避免上一輪殘片污染下一輪 tool_call 解析 / 重複統計。
+                    // 已 yield 給 client 的部分文字救不回，但 has_tools=true 緩衝路徑
+                    // （Claude Code 主場景）content 沒 yield 出去，重試對 client 等於透明。
+                    tracing::warn!(
+                        "[執行編排] 收到 Retrying，清空本輪 answer_buf({}) / reasoning state",
+                        answer_buf.chars().count()
+                    );
+                    answer_buf.clear();
+                    streamed_content = false;
+                    tracker = ReasoningTracker::new();
+                    last_out_tokens = 0;
+                    last_reasoning_tokens = 0;
+                    phase_counts.clear();
+                    skipped_phase_content_chars = 0;
+                }
             }
         }
 
