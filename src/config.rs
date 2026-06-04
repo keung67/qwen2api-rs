@@ -83,6 +83,15 @@ pub struct Settings {
     pub pool_ready_index: bool,
     /// Pillar 3：連線保活。每 N 秒對上游送一次輕量請求保溫一條連線；0=關閉（預設，風控敏感）。
     pub conn_keepalive_seconds: u64,
+
+    /// Token refresh worker（解決「JWT 30 天 TTL → 16k 帳號集體過期」）。
+    /// 每 INTERVAL_HOURS 跑一輪：解所有帳號 JWT exp，篩出 exp < now+AHEAD_DAYS 的，分批跑
+    /// chat.qwen.ai signin 拿新 token；每帳號間 JITTER_MS 隨機停頓避風控。0=關閉 worker。
+    pub token_refresh_interval_hours: u64,
+    pub token_refresh_ahead_days: i64,
+    pub token_refresh_batch_per_cycle: usize,
+    pub token_refresh_jitter_min_ms: u64,
+    pub token_refresh_jitter_max_ms: u64,
 }
 
 /// 依序讀取代理環境變數（含大小寫變體）。
@@ -160,6 +169,12 @@ impl Settings {
                 .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "off" | "no"))
                 .unwrap_or(true),
             conn_keepalive_seconds: env_or("CONN_KEEPALIVE_SECONDS", 0u64),
+            // Token refresh worker（預設開啟，每 6h 跑、提前 7 天刷、每輪上限 500、每帳號 2-5 秒 jitter）
+            token_refresh_interval_hours: env_or("TOKEN_REFRESH_INTERVAL_HOURS", 6u64),
+            token_refresh_ahead_days: env_or("TOKEN_REFRESH_AHEAD_DAYS", 7i64),
+            token_refresh_batch_per_cycle: env_or("TOKEN_REFRESH_BATCH_PER_CYCLE", 500usize),
+            token_refresh_jitter_min_ms: env_or("TOKEN_REFRESH_JITTER_MIN_MS", 2000u64),
+            token_refresh_jitter_max_ms: env_or("TOKEN_REFRESH_JITTER_MAX_MS", 5000u64),
         }
     }
 }

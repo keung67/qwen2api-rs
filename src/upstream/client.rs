@@ -11,6 +11,14 @@ use std::time::Duration;
 pub const BASE_URL: &str = "https://chat.qwen.ai";
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/// signin 的密碼校驗格式（chat.qwen.ai 後端比對的是 sha256 hex，不是明文）。
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
+}
+
 /// 依出口代理建立 reqwest client。proxy 為 None/空 → 不顯式設代理（reqwest 仍會讀 HTTP(S)_PROXY env）。
 fn build_http(proxy: Option<&str>) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
@@ -82,6 +90,59 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/")
             .header("Origin", "https://chat.qwen.ai")
+    }
+
+    /// chat.qwen.ai 純 HTTP 重登（取代過期 / 即將過期的 token）。
+    ///
+    /// 端點：POST /api/v1/auths/signin，body `{email, password: sha256_hex(plain)}`。
+    /// 校驗格式取自 OneDragon 註冊工具 `one_dragon.py:423`，**送明文會回 400 incorrect**。
+    /// 成功回 200 + JSON 含 `token`（209 字元 HS256 JWT，TTL ~30 天）。
+    /// 細節見 memory `reference-qwen-signin-protocol`。
+    pub async fn signin(&self, email: &str, plain_password: &str) -> AppResult<String> {
+        if plain_password.is_empty() {
+            return Err(AppError::Unauthorized("帳號無 password 欄位，無法重登".into()));
+        }
+        let url = format!("{BASE_URL}/api/v1/auths/signin");
+        let body = serde_json::json!({
+            "email": email,
+            "password": sha256_hex(plain_password),
+        });
+        let resp = self
+            .http
+            .load()
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("User-Agent", UA)
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("Referer", "https://chat.qwen.ai/auth")
+            .header("Origin", "https://chat.qwen.ai")
+            .timeout(Duration::from_secs(20))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Upstream(format!("signin 連線失敗: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status == 200 {
+            let v: Value = serde_json::from_str(&text)
+                .map_err(|e| AppError::Upstream(format!("signin 回應解析失敗: {e}")))?;
+            let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            if token.is_empty() {
+                return Err(AppError::Upstream("signin 200 但 token 欄位空".into()));
+            }
+            return Ok(token.to_string());
+        }
+        // 失敗：把上游 detail 字串（"incorrect" / "not registered" / "..."）抓出
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(String::from))
+            .unwrap_or_else(|| text.chars().take(160).collect());
+        if matches!(status, 400 | 401 | 403) {
+            Err(AppError::Unauthorized(format!("signin HTTP {status}: {detail}")))
+        } else {
+            Err(AppError::Upstream(format!("signin HTTP {status}: {detail}")))
+        }
     }
 
     /// 驗證 token：GET /api/v1/auths/ → 200 且 role==user。

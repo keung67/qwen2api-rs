@@ -161,6 +161,147 @@ pub async fn verify_account(State(state): State<AppState>, headers: HeaderMap, P
     .into_response()
 }
 
+/// 單帳號 refresh：跑 chat.qwen.ai signin 拿新 JWT 覆寫。
+///
+/// 流程：取帳號 password → client.signin(email, password) → pool.replace_token。
+/// 失敗時把上游錯誤訊息（"incorrect"/"not registered"/etc.）寫入 last_error 留證。
+/// 細節見 memory `reference-qwen-signin-protocol`。
+pub async fn resign_account(State(state): State<AppState>, headers: HeaderMap, Path(email): Path<String>) -> Response {
+    admin_guard!(state, headers);
+    let (_, password) = match state.pool.token_and_password_of(&email).await {
+        Some(p) => p,
+        None => return AppError::NotFound("Account not found".into()).into_response(),
+    };
+    if password.is_empty() {
+        let msg = "帳號無 password 欄位，無法重登";
+        state.pool.apply_verify(&email, false, "auth_error", msg).await;
+        return Json(json!({"email": email, "ok": false, "error": msg})).into_response();
+    }
+    match state.client.signin(&email, &password).await {
+        Ok(new_token) => {
+            let updated = state.pool.replace_token(&email, new_token.clone()).await;
+            Json(json!({
+                "email": email,
+                "ok": true,
+                "updated": updated,
+                "token_len": new_token.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            state.pool.apply_verify(&email, false, "auth_error", &msg).await;
+            Json(json!({"email": email, "ok": false, "error": msg})).into_response()
+        }
+    }
+}
+
+/// 批次 refresh（單次上限 200，避免 HTTP timeout + 風控壓力）。
+/// 全表 refresh 由背景 worker 按 exp 過濾後分批跑；此 endpoint 給管理者「手動觸發一輪」。
+pub async fn resign_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_guard!(state, headers);
+    let accounts = state.pool.list().await;
+    let total = accounts.len();
+    let cap = 200usize;
+    let mut ok_n = 0usize;
+    let mut failed = 0usize;
+    let mut skipped_no_pw = 0usize;
+    let mut results = Vec::new();
+    for a in accounts.into_iter().take(cap) {
+        if a.password.is_empty() {
+            skipped_no_pw += 1;
+            continue;
+        }
+        match state.client.signin(&a.email, &a.password).await {
+            Ok(new_token) => {
+                let _ = state.pool.replace_token(&a.email, new_token).await;
+                ok_n += 1;
+                results.push(json!({"email": a.email, "ok": true}));
+            }
+            Err(e) => {
+                failed += 1;
+                let msg = e.to_string();
+                state.pool.apply_verify(&a.email, false, "auth_error", &msg).await;
+                results.push(json!({"email": a.email, "ok": false, "error": msg}));
+            }
+        }
+        // 風控 jitter：每帳號間 100ms 停頓（保守，背景 worker 應更慢）
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Json(json!({
+        "ok": true,
+        "summary": {
+            "total": total,
+            "attempted": cap.min(total),
+            "refreshed": ok_n,
+            "failed": failed,
+            "skipped_no_password": skipped_no_pw,
+        },
+        "results": results,
+        "note": if total > cap { format!("帳號過多，本次僅 refresh 前 {cap} 個；其餘由背景 worker 按 exp 過濾分批跑") } else { String::new() },
+    }))
+    .into_response()
+}
+
+/// JWT exp 分桶摘要：給前端 dashboard 顯示「N 天內過期 X 個」警示。
+/// JWT payload 是 base64(json{id, exp, last_password_change})；解 exp 後分桶。
+pub async fn accounts_exp_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    admin_guard!(state, headers);
+    use crate::util::jwt_exp;
+    let accounts = state.pool.list().await;
+    let now = crate::util::now_unix();
+    let mut total = 0;
+    let mut no_token = 0;
+    let mut no_exp = 0;
+    let mut expired = 0;
+    let mut in_7d = 0;
+    let mut in_30d = 0;
+    let mut after_30d = 0;
+    let mut earliest_exp: Option<i64> = None;
+    let mut soon_emails: Vec<String> = Vec::new(); // 7 天內到期，up to 30 個
+    for a in &accounts {
+        total += 1;
+        if a.token.is_empty() {
+            no_token += 1;
+            continue;
+        }
+        let Some(exp) = jwt_exp(&a.token) else {
+            no_exp += 1;
+            continue;
+        };
+        if earliest_exp.map_or(true, |e| exp < e) {
+            earliest_exp = Some(exp);
+        }
+        let days = (exp - now) as f64 / 86400.0;
+        if days < 0.0 {
+            expired += 1;
+        } else if days < 7.0 {
+            in_7d += 1;
+            if soon_emails.len() < 30 {
+                soon_emails.push(a.email.clone());
+            }
+        } else if days < 30.0 {
+            in_30d += 1;
+        } else {
+            after_30d += 1;
+        }
+    }
+    Json(json!({
+        "now": now,
+        "total": total,
+        "no_token": no_token,
+        "no_exp": no_exp,
+        "expired": expired,
+        "expiring_within_7d": in_7d,
+        "expiring_within_30d": in_30d,
+        "after_30d": after_30d,
+        "earliest_exp_unix": earliest_exp,
+        "earliest_exp_days_from_now": earliest_exp.map(|e| (e - now) as f64 / 86400.0),
+        "soon_sample": soon_emails,
+    }))
+    .into_response()
+}
+
 /// 全量巡检。
 pub async fn verify_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
     admin_guard!(state, headers);

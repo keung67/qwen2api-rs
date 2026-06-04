@@ -33,8 +33,11 @@ fn admin_router() -> Router<state::AppState> {
         .route("/accounts/register", post(api::admin::register_account))
         .route("/accounts/{email}", delete(api::admin::delete_account))
         .route("/accounts/{email}/verify", post(api::admin::verify_account))
+        .route("/accounts/{email}/resign", post(api::admin::resign_account))
         .route("/accounts/{email}/activate", post(api::admin::activate_account))
         .route("/verify", post(api::admin::verify_all))
+        .route("/resign_all", post(api::admin::resign_all))
+        .route("/accounts/exp_summary", get(api::admin::accounts_exp_summary))
         .route("/keys", get(api::admin::get_keys).post(api::admin::create_key))
         .route("/keys/{key}", delete(api::admin::delete_key))
         .route("/settings", get(api::admin::get_settings).put(api::admin::update_settings))
@@ -82,6 +85,74 @@ async fn main() {
             }
         });
         tracing::info!("連線保活已啟用：每 {interval}s 保溫一條上游連線");
+    }
+
+    // Token refresh worker：自動 refresh 即將過期的 chat.qwen.ai JWT。
+    // 解決 16,857 個 token 集中過期（同批註冊 → exp 集中）的災難。
+    // 細節見 memory `reference-qwen-signin-protocol`。設 INTERVAL=0 可停用。
+    if state.settings.token_refresh_interval_hours > 0 {
+        let state_w = state.clone();
+        let interval_secs = state.settings.token_refresh_interval_hours * 3600;
+        let ahead_days = state.settings.token_refresh_ahead_days;
+        let batch = state.settings.token_refresh_batch_per_cycle;
+        let jmin = state.settings.token_refresh_jitter_min_ms;
+        let jmax = state.settings.token_refresh_jitter_max_ms.max(jmin);
+        tokio::spawn(async move {
+            // 啟動延遲 30s，避開 cold start
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                let cycle_start = std::time::Instant::now();
+                let now = crate::util::now_unix();
+                let cutoff = now + ahead_days * 86400;
+                let accounts = state_w.pool.list().await;
+                let total = accounts.len();
+                // 篩選：有 password + JWT exp <= cutoff（不解 JWT 失敗的略過，避免污染 stats）
+                let mut due: Vec<(String, String)> = accounts
+                    .into_iter()
+                    .filter(|a| !a.password.is_empty() && !a.token.is_empty())
+                    .filter_map(|a| crate::util::jwt_exp(&a.token).map(|exp| (a, exp)))
+                    .filter(|(_, exp)| *exp <= cutoff)
+                    .map(|(a, _)| (a.email, a.password))
+                    .collect();
+                let due_total = due.len();
+                if due.len() > batch {
+                    due.truncate(batch);
+                }
+                tracing::info!(
+                    "[refresh-worker] 掃描 {total} 帳號；{due_total} 個於 {ahead_days} 天內到期；本輪處理 {}",
+                    due.len()
+                );
+                let mut ok_n = 0usize;
+                let mut fail_n = 0usize;
+                for (email, password) in due {
+                    match state_w.client.signin(&email, &password).await {
+                        Ok(new_token) => {
+                            let _ = state_w.pool.replace_token(&email, new_token).await;
+                            ok_n += 1;
+                        }
+                        Err(e) => {
+                            fail_n += 1;
+                            let msg = e.to_string();
+                            state_w.pool.apply_verify(&email, false, "auth_error", &msg).await;
+                            tracing::warn!("[refresh-worker] {email} refresh 失敗: {msg}");
+                        }
+                    }
+                    let span = jmax.saturating_sub(jmin).max(1);
+                    let jitter = jmin + (rand::random::<u64>() % span);
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                }
+                tracing::info!(
+                    "[refresh-worker] 本輪完成 ok={ok_n} fail={fail_n} 耗時={:?}；睡 {} 小時",
+                    cycle_start.elapsed(),
+                    interval_secs / 3600
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            }
+        });
+        tracing::info!(
+            "Token refresh worker 啟用：每 {}h 跑、提前 {ahead_days}d 刷、每輪上限 {batch}、jitter {jmin}-{jmax}ms",
+            state.settings.token_refresh_interval_hours
+        );
     }
 
     // 嘗試動態抓上游模型列表，更新預設模型（best-effort）

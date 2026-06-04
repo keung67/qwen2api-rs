@@ -327,6 +327,16 @@ impl AccountPool {
         account_pos(&st, email).map(|i| st.accounts[i].token.clone())
     }
 
+    /// 取得某帳號的 (token, password)（依 email）——refresh 流程用。
+    /// password 是註冊時的明文（accounts.json 直接存）；signin 自己 sha256 後送上游。
+    pub async fn token_and_password_of(&self, email: &str) -> Option<(String, String)> {
+        let st = self.state.lock().await;
+        account_pos(&st, email).map(|i| {
+            let a = &st.accounts[i];
+            (a.token.clone(), a.password.clone())
+        })
+    }
+
     /// 取得任一可用帳號 (email, token)（用於檔案上傳並綁定後續對話）。
     pub async fn any_valid_account(&self) -> Option<(String, String)> {
         let now = now_secs();
@@ -716,6 +726,34 @@ impl AccountPool {
             .collect()
     }
 
+    /// 用新 token 覆寫帳號並 reset 為健康狀態。
+    /// 用於 refresh 流程：admin endpoint / 背景 worker 跑完 signin 後寫回新 JWT。
+    /// 一律清 last_error、failures=0、status="valid"——既有 hot-path 的「3 次門檻」失敗計數不該跨 refresh 累積。
+    pub async fn replace_token(&self, email: &str, new_token: String) -> bool {
+        let min_ms = self.min_interval_ms.load(Ordering::Relaxed);
+        let mut ok = false;
+        let snapshot = {
+            let mut st = self.state.lock().await;
+            if let Some(pos) = account_pos(&st, email) {
+                let a = &mut st.accounts[pos];
+                a.token = new_token;
+                a.valid = true;
+                a.activation_pending = false;
+                a.status_code = "valid".to_string();
+                a.last_error = String::new();
+                a.consecutive_failures = 0;
+                a.rate_limit_strikes = 0;
+                ok = true;
+            }
+            reindex_email(&mut st, email, min_ms);
+            st.accounts.clone()
+        };
+        if ok {
+            self.persist(&snapshot).await;
+        }
+        ok
+    }
+
     /// 套用驗證結果（管理台單獨/全量驗證用）。
     pub async fn apply_verify(&self, email: &str, valid: bool, status_code: &str, error: &str) {
         let min_ms = self.min_interval_ms.load(Ordering::Relaxed);
@@ -942,6 +980,47 @@ mod tests {
             assert!(!a.valid, "pending_activation 應立即失效");
             assert!(a.activation_pending, "activation_pending 旗標必設");
         }
+    }
+
+    /// replace_token：refresh 流程的核心。新 token 寫入 + 健康狀態完整 reset。
+    /// 重點：先前累積的 consecutive_failures、last_error、status_code 都不能殘留。
+    #[tokio::test]
+    async fn replace_token_resets_full_health() {
+        let pool = test_pool(vec![mk("r", false, 0, 0.0, 0.0, 0.0)], true, 0, 2);
+        // 模擬一個「死了」的帳號：valid=false、有 last_error、failures=2、status=auth_error
+        {
+            let mut st = pool.state.lock().await;
+            let pos = account_pos(&st, "r").unwrap();
+            let a = &mut st.accounts[pos];
+            a.valid = false;
+            a.status_code = "auth_error".to_string();
+            a.last_error = "舊上游 401 訊息".to_string();
+            a.consecutive_failures = 2;
+            a.rate_limit_strikes = 1;
+            a.activation_pending = true;
+            a.token = "OLD".to_string();
+        }
+
+        let ok = pool.replace_token("r", "NEW_209_CHAR_JWT".to_string()).await;
+        assert!(ok);
+
+        let st = pool.state.lock().await;
+        let a = &st.accounts[account_pos(&st, "r").unwrap()];
+        assert_eq!(a.token, "NEW_209_CHAR_JWT");
+        assert!(a.valid, "valid 必還原");
+        assert_eq!(a.status_code, "valid");
+        assert_eq!(a.last_error, "", "last_error 必清");
+        assert_eq!(a.consecutive_failures, 0, "failures 必歸零");
+        assert_eq!(a.rate_limit_strikes, 0, "rate_limit_strikes 必歸零");
+        assert!(!a.activation_pending, "activation_pending 必清");
+    }
+
+    /// replace_token 對不存在的 email 應回 false 且不 panic。
+    #[tokio::test]
+    async fn replace_token_unknown_email_is_noop() {
+        let pool = test_pool(vec![mk("x", true, 0, 0.0, 0.0, 0.0)], true, 0, 2);
+        let ok = pool.replace_token("nonexistent@nope", "X".to_string()).await;
+        assert!(!ok);
     }
 
     /// release 後（min_interval=0）帳號應可再次取得；global_in_use 收支平衡。

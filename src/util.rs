@@ -1,6 +1,20 @@
 //! 共用工具函式。
 
+use base64::Engine;
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 解 chat.qwen.ai web JWT 的 exp 欄位（unix 秒），失敗回 None。
+/// 不驗簽（驗簽密鑰只有 Qwen 後端有）——僅用於 client 端時序判定（refresh 排程、過期分桶等）。
+pub fn jwt_exp(token: &str) -> Option<i64> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let v: Value = serde_json::from_slice(&payload).ok()?;
+    v.get("exp").and_then(|e| e.as_i64())
+}
 
 /// Unix epoch 秒（浮點，對齊 Python time.time()）。
 pub fn now_secs() -> f64 {

@@ -202,6 +202,13 @@ function renderDashboard() {
   const statsBox = el('div', { id: 'dashStats', class: 'stats-grid' });
   v.appendChild(statsBox);
 
+  // Token 过期摘要 + 批次刷新（拉 /api/admin/accounts/exp_summary，30 秒/次）
+  const expCard = el('div', { class: 'card', id: 'dashExpCard' }, [
+    el('div', { class: 'card-title' }, 'Token 過期分布 & 自動刷新'),
+    el('div', { id: 'dashExpBody' }, [loadingNode()]),
+  ]);
+  v.appendChild(expCard);
+
   // 账号并发详情
   const accCard = el('div', { class: 'card' }, [
     el('div', { class: 'card-title' }, '账号并发详情'),
@@ -213,6 +220,7 @@ function renderDashboard() {
   v.appendChild(apiPoolCard());
 
   let timer = null;
+  let expTimer = null;
   async function poll() {
     const r = await api('/api/admin/status');
     if (!r.ok) {
@@ -228,10 +236,73 @@ function renderDashboard() {
     renderDashStats(statsBox, r.data);
     renderDashTable(document.getElementById('dashTable'), r.data);
   }
+  async function pollExp() {
+    const r = await api('/api/admin/accounts/exp_summary');
+    if (r.ok) renderDashExp(document.getElementById('dashExpBody'), r.data);
+  }
 
   poll();
+  pollExp();
   timer = setInterval(poll, 3000);
-  cleanupFn = () => clearInterval(timer);
+  expTimer = setInterval(pollExp, 30000);
+  cleanupFn = () => { clearInterval(timer); clearInterval(expTimer); };
+}
+
+/** Token 過期分布卡片 + 「立即批次刷新」按鈕 */
+function renderDashExp(host, d) {
+  if (!host || !d) return;
+  const expired = d.expired || 0;
+  const in7 = d.expiring_within_7d || 0;
+  const in30 = d.expiring_within_30d || 0;
+  const after30 = d.after_30d || 0;
+  const noTok = d.no_token || 0;
+  const noExp = d.no_exp || 0;
+  const earliestDays = d.earliest_exp_days_from_now;
+  const sample = d.soon_sample || [];
+  // 風險等級：已過期 OR 7 天內 > 0 → 紅；30 天內 > 0 → 黃；皆無 → 綠
+  const level = (expired > 0 || in7 > 0) ? 'red' : (in30 > 0 ? 'yellow' : 'green');
+  const levelText = level === 'red' ? '⚠ 緊急' : (level === 'yellow' ? '🟡 注意' : '✓ 健康');
+  const levelColor = level === 'red' ? '#ef4444' : (level === 'yellow' ? '#f59e0b' : '#10b981');
+  host.innerHTML = '';
+  const wrap = el('div', { class: 'exp-grid', style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:10px' });
+  const stat = (label, n, color) => el('div', { class: 'stat', style: `padding:8px;border-radius:6px;background:var(--bg-elev,#222)` }, [
+    el('div', { class: 'label', style: 'color:var(--fg-dim);font-size:12px' }, label),
+    el('div', { class: 'num', style: `font-size:22px;font-weight:600;color:${color || 'var(--fg)'}` }, fmtInt(n)),
+  ]);
+  wrap.appendChild(stat('已過期', expired, expired > 0 ? '#ef4444' : null));
+  wrap.appendChild(stat('7 天內到期', in7, in7 > 0 ? '#ef4444' : null));
+  wrap.appendChild(stat('7-30 天到期', in30, in30 > 0 ? '#f59e0b' : null));
+  wrap.appendChild(stat('30 天後到期', after30));
+  if (noTok > 0) wrap.appendChild(stat('無 token', noTok, '#888'));
+  if (noExp > 0) wrap.appendChild(stat('JWT 解失敗', noExp, '#888'));
+  host.appendChild(wrap);
+
+  const info = el('div', { style: `padding:8px;border-left:3px solid ${levelColor};margin-bottom:10px;color:var(--fg-dim);font-size:13px` }, [
+    el('span', { style: `color:${levelColor};font-weight:600;margin-right:8px` }, levelText),
+    el('span', null, earliestDays != null
+      ? `最早到期還有 ${earliestDays.toFixed(1)} 天；背景 worker 每 6 小時自動 refresh 7 天內到期的帳號（細節見 .env: TOKEN_REFRESH_*）`
+      : '背景 worker 自動 refresh；可手動觸發單帳號或批次刷新'),
+  ]);
+  host.appendChild(info);
+
+  if (sample.length) {
+    host.appendChild(el('div', { style: 'font-size:12px;color:var(--fg-dim);margin-bottom:8px' },
+      `7 天內到期樣本 (${sample.length}/${in7})：${sample.slice(0, 10).map(escapeHtml).join(', ')}${sample.length > 10 ? '…' : ''}`));
+  }
+
+  const btn = el('button', { class: 'btn btn-sm', onclick: async () => {
+    if (!confirm('觸發批次刷新（每次上限 200 個帳號，含 jitter）。確定？')) return;
+    btn.disabled = true; btn.textContent = '刷新中（最多 30 秒）…';
+    const rr = await api('/api/admin/resign_all', { method: 'POST' });
+    btn.disabled = false; btn.textContent = '立即批次刷新（≤200/次）';
+    if (rr.ok && rr.data && rr.data.summary) {
+      const s = rr.data.summary;
+      toast(`刷新 ${s.refreshed} 成功 · ${s.failed} 失敗 · ${s.skipped_no_password} 跳過無密碼`, s.failed > s.refreshed ? 'error' : 'success');
+    } else {
+      toast('批次刷新請求失敗', 'error');
+    }
+  } }, '立即批次刷新（≤200/次）');
+  host.appendChild(btn);
 }
 
 /** 渲染顶部统计卡 */
@@ -792,6 +863,7 @@ function renderAccTable(host, accounts) {
       <td style="max-width:260px;color:var(--fg-dim)">${note || '—'}</td>
       <td><div class="cell-actions">
         <button class="btn btn-sm" data-act="verify" data-email="${escapeHtml(enc)}">验证</button>
+        <button class="btn btn-sm" data-act="resign" data-email="${escapeHtml(enc)}" title="用 password 重新登入 chat.qwen.ai 取得新 token">刷新</button>
         ${activateBtn}
         <button class="btn btn-sm btn-danger" data-act="delete" data-email="${escapeHtml(enc)}" data-raw="${escapeHtml(email)}">删除</button>
       </div></td>
@@ -815,6 +887,16 @@ function renderAccTable(host, accounts) {
       const rr = await api(`/api/admin/accounts/${enc}/verify`, { method: 'POST' });
       if (rr.ok) toast(rr.data && rr.data.valid ? '账号有效' : '账号无效', rr.data && rr.data.valid ? 'success' : 'error');
       else toast('验证请求失败', 'error');
+      loadAccounts();
+    } else if (act === 'resign') {
+      btn.disabled = true; btn.textContent = '刷新中…';
+      const rr = await api(`/api/admin/accounts/${enc}/resign`, { method: 'POST' });
+      if (rr.ok && rr.data && rr.data.ok) {
+        toast(`已刷新 token（长度 ${rr.data.token_len}）`, 'success');
+      } else {
+        const msg = (rr.data && rr.data.error) || '刷新失败';
+        toast(`刷新失败：${msg}`, 'error');
+      }
       loadAccounts();
     } else if (act === 'activate') {
       btn.disabled = true;
