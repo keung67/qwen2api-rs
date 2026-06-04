@@ -543,14 +543,26 @@ function renderStatsByModel(host, d) {
   const list = (d && d.by_model) || [];
   host.innerHTML = '';
   if (!list.length) { host.appendChild(el('div', { class: 'empty' }, '暂无数据')); return; }
-  const rows = list.map(m => `<tr>
-    <td class="mono">${escapeHtml(m.model || '—')}</td>
-    <td>${fmtInt(m.requests)}</td>
-    <td>${fmtInt(m.total_tokens)}</td>
-    <td>${fmtMs(m.avg_ttft_ms)}</td>
-    <td>${fmtMs(m.avg_duration_ms)}</td>
-  </tr>`).join('');
-  host.appendChild(elTable(['模型', '请求', 'Tokens', '平均首字', '平均耗时'], rows));
+  // 平均值無法反映尾部退化；後端在 by_model 上補了 min/p50/p95/max TTFT，
+  // 此處主顯 p50（典型）+ p95（尾部）；min/max 放 title 供 hover 細看。
+  const rows = list.map(m => {
+    const p50 = m.p50_ttft_ms, p95 = m.p95_ttft_ms;
+    const hasPct = p50 != null || p95 != null;
+    const main = hasPct
+      ? `${p50 != null ? fmtMs(p50) : '—'} <small style="color:var(--fg-dim)">/ ${p95 != null ? fmtMs(p95) : '—'}</small>`
+      : (m.avg_ttft_ms != null ? fmtMs(m.avg_ttft_ms) : '—');
+    const tip = hasPct
+      ? `min ${m.min_ttft_ms != null ? fmtMs(m.min_ttft_ms) : '—'} · p50 ${p50 != null ? fmtMs(p50) : '—'} · p95 ${p95 != null ? fmtMs(p95) : '—'} · max ${m.max_ttft_ms != null ? fmtMs(m.max_ttft_ms) : '—'} · 平均 ${m.avg_ttft_ms != null ? fmtMs(m.avg_ttft_ms) : '—'}`
+      : '该模型暂无首字延迟样本';
+    return `<tr>
+      <td class="mono">${escapeHtml(m.model || '—')}</td>
+      <td>${fmtInt(m.requests)}</td>
+      <td>${fmtInt(m.total_tokens)}</td>
+      <td title="${escapeHtml(tip)}">${main}</td>
+      <td>${fmtMs(m.avg_duration_ms)}</td>
+    </tr>`;
+  }).join('');
+  host.appendChild(elTable(['模型', '请求', 'Tokens', 'TTFT p50/p95', '平均耗时'], rows));
 }
 
 function renderStatsBySurface(host, d) {
@@ -1068,9 +1080,10 @@ function renderTest() {
 
     const body = {
       model,
+      // 留所有 user + 有 content 的 assistant；剛 push 的空 assistant placeholder 因無 content 自然被濾掉，
+      // 不可再 .slice(0,-1)（會把當輪的 user 訊息一起砍掉，導致 AI 永遠晚一輪回答）。
       messages: state.messages
         .filter(m => m.role === 'user' || (m.role === 'assistant' && m.content))
-        .slice(0, -1) // 去掉刚 push 的空 assistant
         .map(m => ({ role: m.role, content: m.content })),
       stream: state.streaming,
       include_reasoning: state.thinking,

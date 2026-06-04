@@ -9,6 +9,7 @@
 
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -250,8 +251,12 @@ pub fn query_dashboard(path: &Path, since_ms: i64, bucket_ms: i64) -> rusqlite::
         |r| r.get(0),
     )?;
 
-    // --- by_model ---
+    // --- by_model（基本聚合 + TTFT 分位數）---
+    // 平均值單一數字資訊量低，補上 min/p50/p95/max 才能看出延遲分佈（如尾部退化、冷啟動）。
+    // SQLite 沒原生 percentile_cont，但 bundled 版本（>=3.25）支援 window function，
+    // 用 ROW_NUMBER + COUNT 在 partition 內做整數百分位（rn = (cnt*P + 50)/100，cnt≥1 永遠命中）。
     let by_model = {
+        // 基本聚合（已含平均，欄位順序勿動，避免錯位）
         let mut stmt = conn.prepare(
             "SELECT model, COUNT(*), COALESCE(SUM(total_tokens),0), AVG(ttft_ms), AVG(duration_ms)
              FROM request_logs WHERE ts_ms >= ?1
@@ -268,7 +273,49 @@ pub fn query_dashboard(path: &Path, since_ms: i64, bucket_ms: i64) -> rusqlite::
                 "avg_duration_ms": avg_dur.map(|v| v.round() as i64),
             }))
         })?;
-        rows.collect::<rusqlite::Result<Vec<Value>>>()?
+        let mut base: Vec<Value> = rows.collect::<rusqlite::Result<Vec<Value>>>()?;
+
+        // TTFT 分位數（只計 ttft_ms IS NOT NULL 的紀錄）
+        let mut ts_stmt = conn.prepare(
+            "WITH t AS (
+                 SELECT model, ttft_ms,
+                        ROW_NUMBER() OVER (PARTITION BY model ORDER BY ttft_ms) AS rn,
+                        COUNT(*)     OVER (PARTITION BY model)                  AS cnt
+                 FROM request_logs
+                 WHERE ts_ms >= ?1 AND ttft_ms IS NOT NULL
+             )
+             SELECT model,
+                    MIN(ttft_ms) AS min_ttft,
+                    MAX(CASE WHEN rn = (cnt * 50 + 50) / 100 THEN ttft_ms END) AS p50_ttft,
+                    MAX(CASE WHEN rn = (cnt * 95 + 50) / 100 THEN ttft_ms END) AS p95_ttft,
+                    MAX(ttft_ms) AS max_ttft
+             FROM t
+             GROUP BY model",
+        )?;
+        let ttft_map: HashMap<String, (i64, i64, i64, i64)> = ts_stmt
+            .query_map(params![since_ms], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        r.get::<_, i64>(4)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+
+        for entry in base.iter_mut() {
+            let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some((min_t, p50, p95, max_t)) = ttft_map.get(&model) {
+                entry["min_ttft_ms"] = json!(min_t);
+                entry["p50_ttft_ms"] = json!(p50);
+                entry["p95_ttft_ms"] = json!(p95);
+                entry["max_ttft_ms"] = json!(max_t);
+            }
+        }
+        base
     };
 
     // --- by_surface ---
