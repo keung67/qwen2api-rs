@@ -47,6 +47,12 @@ pub fn uuid4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// 產生 UUID v4 格式的請求 ID，供上游 HTTP 請求的 x-request-id 標頭使用。
+/// 格式：xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx（符合 RFC 4122）。
+pub fn qwen_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Python len()：計算 Unicode 標量數（非 bytes）。
 pub fn char_len(s: &str) -> usize {
     s.chars().count()

@@ -2,7 +2,7 @@
 //! 用 reqwest（rustls + http2 + 連線池）；headers 與 Python 對齊。
 
 use crate::error::{AppError, AppResult};
-use crate::util::now_unix;
+use crate::util::{now_unix, qwen_request_id};
 use arc_swap::ArcSwap;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -90,6 +90,7 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/")
             .header("Origin", "https://chat.qwen.ai")
+            .header("x-request-id", qwen_request_id())
     }
 
     /// chat.qwen.ai 純 HTTP 重登（取代過期 / 即將過期的 token）。
@@ -117,6 +118,7 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/auth")
             .header("Origin", "https://chat.qwen.ai")
+            .header("x-request-id", qwen_request_id())
             .timeout(Duration::from_secs(20))
             .json(&body)
             .send()
