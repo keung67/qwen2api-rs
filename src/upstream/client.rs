@@ -8,7 +8,9 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const BASE_URL: &str = "https://chat.qwen.ai";
+pub const BASE_URL: &str =
+    option_env!("QWEN_BASE_URL")
+        .unwrap_or("https://chat.qwen.ai");
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// signin 的密碼校驗格式（chat.qwen.ai 後端比對的是 sha256 hex，不是明文）。
